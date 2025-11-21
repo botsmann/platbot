@@ -83,61 +83,66 @@ async def render_executor_tasks_list(context: ContextTypes.DEFAULT_TYPE, user_id
     if chat_id is None:
         logger.error("chat_id is None")
         return
+
     category = db.get_user_category(user_id)
     logger.debug(f"category={category}")
-        if should_notify:
-            await update.message.reply_text(
-                f"✅ Задача #{task_id} отмечена как выполненная! Ожидайте проверки менеджером."
-            )
-            # Мы хотим гарантированно прислать исполнителю СВЕЖЕЕ сообщение со списком задач.
-            # Иногда кешированное message_id мешает render_executor_tasks_list редактировать/отправлять новое сообщение,
-            # поэтому временно удалим кеш и попросим отрисовать список заново (force new message).
-            chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
-            old_list_id = context.user_data.pop('executor_list_message_id', None)
-            try:
-                await render_executor_tasks_list(context, user_id, chat_id, base_message=None, allow_new_message=True)
-            except Exception as e:
-                logger.error(f"Ошибка при рендере списка задач исполнителя: {e}", exc_info=True)
-            # Если всё же список не был отправлен (например, у пользователя не установлена категория),
-            # отправим надёжный fallback: выбор категории/меню задач.
-            if not context.user_data.get('executor_list_message_id'):
-                try:
-                    # Пробуем отправить явное меню задач
-                    keyboard = [
-                        [InlineKeyboardButton("� Мои задачи", callback_data="view_tasks_executor")],
-                        [InlineKeyboardButton("🏠 В начало", callback_data="restart")]
-                    ]
-                    reply_markup = InlineKeyboardMarkup(keyboard)
-                    await update.message.reply_text(
-                        f"👋 {executor_username}, вот ваши задачи:",
-                        reply_markup=reply_markup
-                    )
-                except Exception:
-                    try:
-                        await send_category_selection(update.message, executor_username)
-                    except Exception:
-                        logger.error("Не удалось отобразить меню задач/категорий после выполнения задачи.", exc_info=True)
-            # Оставляем старое значение executor_list_message_id если нужно (мы удаляли его намеренно)
-            if old_list_id:
-                # Не восстанавливаем кеш, т.к. старый message_id скорее всего неактуален; оставим новый, если он есть
-                pass
-    if list_message_id:
+
+    # Если категория не установлена — попросим выбрать её
+    if not category:
         try:
-            logger.debug(f"Пытаюсь отредактировать сообщение по message_id={list_message_id}")
+            await send_category_selection(context.bot, update_username := (None))
+        except Exception:
+            # fallback: просто отправим текст-приглашение
+            try:
+                await context.bot.send_message(chat_id=chat_id, text="👋 Пожалуйста, выберите категорию через /start или меню.")
+            except Exception:
+                logger.exception("Не удалось отправить сообщение о выборе категории")
+        return
+
+    # Собираем задачи для исполнителя в этой категории
+    tasks_new = db.get_tasks(status=STATUS_NEW, category=category) or []
+    tasks_redo = db.get_tasks(status=STATUS_REDO, category=category) or []
+    tasks = tasks_new + tasks_redo
+
+    if not tasks:
+        text = "📭 Нет задач в вашей категории."
+        keyboard = [[InlineKeyboardButton("🏠 В начало", callback_data="restart")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+    else:
+        # Показываем только заголовок категории в тексте — все детали (id и описание)
+        # будут доступны на кнопках ниже
+        lines = [f"📂 Категория: {category}", ""]
+        keyboard = []
+        for t in tasks:
+            preview = (t.get('comment') or '')[:60]
+            preview_text = preview.replace('"', '”')
+            # Формат кнопки: Задача #5 - "описание"
+            button_label = f"Задача #{t['task_id']} - \"{preview_text}\""
+            keyboard.append([InlineKeyboardButton(button_label, callback_data=f"task_{t['task_id']}")])
+        text = "\n".join(lines)
+        keyboard.append([InlineKeyboardButton("🏠 В начало", callback_data="restart")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Попытка отредактировать существующее сообщение списка исполнителя
+    list_message_id = context.user_data.get('executor_list_message_id')
+    try:
+        if base_message and base_message.message_id:
+            await base_message.edit_text(text, reply_markup=reply_markup)
+            context.user_data['executor_list_message_id'] = base_message.message_id
+            return
+        if list_message_id:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=list_message_id, text=text, reply_markup=reply_markup)
             context.user_data['executor_list_message_id'] = list_message_id
-            logger.debug("Сообщение отредактировано успешно")
             return
-        except Exception as e:
-            logger.error(f"Не удалось отредактировать сообщение по message_id: {e}", exc_info=True)
+    except Exception:
+        logger.debug("Не удалось отредактировать старое сообщение, отправлю новое", exc_info=True)
+
     if allow_new_message:
         try:
-            logger.debug("Отправляю новое сообщение")
             sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
             context.user_data['executor_list_message_id'] = sent.message_id
-            logger.debug(f"Новое сообщение отправлено, message_id={sent.message_id}")
-        except Exception as e:
-            logger.error(f"Не удалось отправить новое сообщение: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Не удалось отправить сообщение со списком задач исполнителя")
 
 
 async def cleanup_executor_task_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int], task_id: Optional[int] = None):
@@ -182,7 +187,12 @@ async def render_manager_tasks_list(update: Update, context: ContextTypes.DEFAUL
     tasks = db.get_tasks()
     context.user_data['return_to'] = 'manager_menu'
     if not tasks:
-        keyboard = [[InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")]]
+        # Добавляем кнопку выгрузки фото для отчета и кнопку возврата в главное меню менеджера
+        keyboard = [
+            [InlineKeyboardButton("📤 Выгрузить все фото для отчета", callback_data="export_report_photos")],
+            [InlineKeyboardButton("🧹 Удалить завершенные", callback_data="delete_completed_tasks")],
+            [InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         text = "📭 Нет задач."
     else:
@@ -204,8 +214,11 @@ async def render_manager_tasks_list(update: Update, context: ContextTypes.DEFAUL
                 f"📷 Задача #{task['task_id']} - {task['status']}",
                 callback_data=f"view_task_photo_{task['task_id']}"
             )])
-        keyboard.append([InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    # Кнопки: выгрузка фото, удалить завершенные, возврат в меню
+    keyboard.append([InlineKeyboardButton("📤 Выгрузить все фото для отчета", callback_data="export_report_photos")])
+    keyboard.append([InlineKeyboardButton("🧹 Удалить завершенные", callback_data="delete_completed_tasks")])
+    keyboard.append([InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
     chat_id = update.effective_chat.id if update.effective_chat else None
     # Сначала пробуем редактировать сообщение, с которого пришёл запрос
     if base_message:
@@ -512,12 +525,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not photos:
             msg = (
-                "Сейчас нет фотографий для отчета. Чтобы получить отчёт — убедитесь, что исполнители прикрепили фото результата к задачам и задачи не были удалены."
+                "Нет фотографий для отчета. Чтобы они появились - проверьте все выполненные задачи и не удаляйте их - отчет появится здесь!"
             )
+            keyboard = [[InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             try:
-                await query.message.reply_text(msg)
+                await query.message.reply_text(msg, reply_markup=reply_markup)
             except:
-                await query.message.reply_text(msg)
+                await query.message.reply_text(msg, reply_markup=reply_markup)
             return
 
         total = len(photos)
@@ -594,6 +609,80 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text="Готово — архив со всеми фото отправлен.", reply_markup=reply_markup)
         except:
             pass
+        return
+
+    if data == "delete_completed_tasks":
+        # Показать подтверждение удаления: сколько задач будет удалено и предупреждение
+        if role != "manager":
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        tasks_to_delete = db.get_tasks(status=STATUS_APPROVED) or []
+        count = len(tasks_to_delete)
+        if count == 0:
+            try:
+                await query.message.reply_text(
+                    "Нет завершённых задач для удаления.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")]])
+                )
+            except:
+                pass
+            return
+
+        text = (
+            f"⚠️ Будет удалено {count} задач(а) со статусом \"Задача завершена\".\n"
+            "Это действие не может быть отменено. Вы уверены?"
+        )
+        keyboard = [
+            [InlineKeyboardButton(f"✅ Удалить {count} задач (без восстановления)", callback_data="confirm_delete_completed")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            # Редактируем текущее сообщение если возможно, иначе отправим новое
+            try:
+                await query.edit_message_text(text, reply_markup=reply_markup)
+            except Exception:
+                await query.message.reply_text(text, reply_markup=reply_markup)
+        except Exception:
+            logger.exception("Не удалось показать подтверждение удаления завершённых задач")
+        return
+
+    if data == "confirm_delete_completed":
+        # Выполнить окончательное удаление завершённых задач
+        if role != "manager":
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        tasks_to_delete = db.get_tasks(status=STATUS_APPROVED) or []
+        if not tasks_to_delete:
+            try:
+                await query.message.reply_text("Нет завершённых задач для удаления.")
+            except:
+                pass
+            return
+
+        deleted = 0
+        for t in tasks_to_delete:
+            try:
+                task_id = t['task_id']
+                purge_task_files(task_id, t)
+                db.delete_task(task_id)
+                deleted += 1
+            except Exception as e:
+                logger.error(f"Ошибка при удалении задачи #{t.get('task_id')}: {e}", exc_info=True)
+
+        # Очистим кэши и обновим список менеджера
+        context.user_data.pop('manager_list_message_id', None)
+        context.user_data.pop('review_list_message_id', None)
+
+        try:
+            await query.message.reply_text(f"✅ Удалено {deleted} завершённых задач.")
+        except:
+            pass
+
+        try:
+            await render_manager_tasks_list(update, context, base_message=None)
+        except Exception:
+            logger.exception("Не удалось обновить список менеджера после удаления завершённых задач")
         return
 
     if data == "view_tasks_manager":
@@ -1748,7 +1837,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # рендер списка не отправил сообщение (например, render_executor_tasks_list вернулся
             # без отправки), делаем безопасный fallback — отправляем меню выбора категории.
             try:
-                await render_executor_tasks_list(context, user_id, chat_id)
+                # Force sending a new message (don't edit previous list message)
+                context.user_data.pop('executor_list_message_id', None)
+                await render_executor_tasks_list(context, user_id, chat_id, base_message=None, allow_new_message=True)
             except Exception as e:
                 logger.error(f"Ошибка при рендере списка задач исполнителя: {e}", exc_info=True)
 
