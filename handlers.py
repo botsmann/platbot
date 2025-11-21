@@ -187,13 +187,8 @@ async def render_manager_tasks_list(update: Update, context: ContextTypes.DEFAUL
     tasks = db.get_tasks()
     context.user_data['return_to'] = 'manager_menu'
     if not tasks:
-        # Добавляем кнопку выгрузки фото для отчета и кнопку возврата в главное меню менеджера
-        keyboard = [
-            [InlineKeyboardButton("📤 Выгрузить все фото для отчета", callback_data="export_report_photos")],
-            [InlineKeyboardButton("🧹 Удалить завершенные", callback_data="delete_completed_tasks")],
-            [InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        # Нет задач — покажем только текст, общие кнопки добавляем ниже (чтобы не дублировать)
+        keyboard = []
         text = "📭 Нет задач."
     else:
         text = "📊 Все задачи:\n\n"
