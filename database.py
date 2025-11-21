@@ -497,6 +497,15 @@ class Database:
         conn.close()
         return [row[0] for row in rows]
 
+    def get_all_users(self) -> List[int]:
+        """Получить список всех пользователей, зарегистрированных в БД (user_id)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        rows = cursor.fetchall()
+        conn.close()
+        return [row[0] for row in rows]
+
     def get_all_managers(self) -> List[int]:
         """Получить список всех менеджеров (user_id)"""
         conn = self.get_connection()

@@ -5,7 +5,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 from database import Database
-from config import MANAGER_CODE, STATUS_NEW, STATUS_COMPLETED, STATUS_APPROVED, STATUS_REDO
+from config import MANAGER_CODE, STATUS_NEW, STATUS_COMPLETED, STATUS_APPROVED, STATUS_REDO, DEV_ID, VIP_IDS
+import zipfile
 
 logger = logging.getLogger(__name__)
 db = Database()
@@ -84,38 +85,42 @@ async def render_executor_tasks_list(context: ContextTypes.DEFAULT_TYPE, user_id
         return
     category = db.get_user_category(user_id)
     logger.debug(f"category={category}")
-    if not category:
-        logger.error("category is None")
-        return
-    new_tasks = db.get_tasks(status=STATUS_NEW, category=category)
-    redo_tasks = db.get_tasks(status=STATUS_REDO, category=category)
-    tasks = new_tasks + redo_tasks
-    logger.debug(f"найдено задач: {len(tasks)}")
-    if tasks:
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{CATEGORY_EMOJIS.get(task.get('category'), '')} Задача #{task['task_id']} - {(task.get('comment') or '')[:30]}...",
-                callback_data=f"task_{task['task_id']}"
-            )]
-            for task in tasks
-        ]
-        keyboard.append([InlineKeyboardButton("🚪 Выйти", callback_data="restart")])
-        text = f"Необходимо выполнить {len(tasks)} {format_tasks_accusative(len(tasks))}\n\n📋 Выберите задачу:"
-    else:
-        keyboard = [[InlineKeyboardButton("◀️ В начало", callback_data="restart")]]
-        text = "📭 Нет доступных задач."
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    logger.debug("Пытаюсь отредактировать/отправить сообщение")
-    if base_message:
-        try:
-            logger.debug("Пытаюсь отредактировать base_message")
-            await base_message.edit_text(text, reply_markup=reply_markup)
-            context.user_data['executor_list_message_id'] = base_message.message_id
-            logger.debug("base_message отредактировано успешно")
-            return
-        except Exception as e:
-            logger.error(f"Не удалось отредактировать base_message: {e}", exc_info=True)
-    list_message_id = context.user_data.get('executor_list_message_id')
+        if should_notify:
+            await update.message.reply_text(
+                f"✅ Задача #{task_id} отмечена как выполненная! Ожидайте проверки менеджером."
+            )
+            # Мы хотим гарантированно прислать исполнителю СВЕЖЕЕ сообщение со списком задач.
+            # Иногда кешированное message_id мешает render_executor_tasks_list редактировать/отправлять новое сообщение,
+            # поэтому временно удалим кеш и попросим отрисовать список заново (force new message).
+            chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+            old_list_id = context.user_data.pop('executor_list_message_id', None)
+            try:
+                await render_executor_tasks_list(context, user_id, chat_id, base_message=None, allow_new_message=True)
+            except Exception as e:
+                logger.error(f"Ошибка при рендере списка задач исполнителя: {e}", exc_info=True)
+            # Если всё же список не был отправлен (например, у пользователя не установлена категория),
+            # отправим надёжный fallback: выбор категории/меню задач.
+            if not context.user_data.get('executor_list_message_id'):
+                try:
+                    # Пробуем отправить явное меню задач
+                    keyboard = [
+                        [InlineKeyboardButton("� Мои задачи", callback_data="view_tasks_executor")],
+                        [InlineKeyboardButton("🏠 В начало", callback_data="restart")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(
+                        f"👋 {executor_username}, вот ваши задачи:",
+                        reply_markup=reply_markup
+                    )
+                except Exception:
+                    try:
+                        await send_category_selection(update.message, executor_username)
+                    except Exception:
+                        logger.error("Не удалось отобразить меню задач/категорий после выполнения задачи.", exc_info=True)
+            # Оставляем старое значение executor_list_message_id если нужно (мы удаляли его намеренно)
+            if old_list_id:
+                # Не восстанавливаем кеш, т.к. старый message_id скорее всего неактуален; оставим новый, если он есть
+                pass
     if list_message_id:
         try:
             logger.debug(f"Пытаюсь отредактировать сообщение по message_id={list_message_id}")
@@ -356,6 +361,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "become_manager":
+        # Быстрый доступ для VIP и разработчика
+        if user_id in (VIP_IDS or [] ) or (DEV_ID is not None and user_id == DEV_ID):
+            db.set_user_role(user_id, username, "manager")
+            context.user_data['waiting_for_code'] = False
+            keyboard = [
+                [InlineKeyboardButton("📋 Создать задачу", callback_data="select_category")],
+                [InlineKeyboardButton("📊 Просмотреть задачи", callback_data="view_tasks_manager")],
+                [InlineKeyboardButton("✅ Проверить выполненные", callback_data="review_tasks")],
+                [InlineKeyboardButton("📨 Меню рассылок", callback_data="mail_menu")],
+                [InlineKeyboardButton("🏠 В начало", callback_data="restart")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await query.edit_message_text("✅ Вы были определены разработчиком, как менеджер. Пароль вводить не нужно.", reply_markup=reply_markup)
+            except:
+                await query.message.reply_text("✅ Вы были определены разработчиком, как менеджер. Пароль вводить не нужно.", reply_markup=reply_markup)
+            return
+
+        # Обычная ветка: запрашиваем код менеджера
         keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="restart")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         try:
@@ -385,6 +409,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✉️ Введите текст для рассылки всем исполнителям:", reply_markup=reply_markup)
         except:
             await query.message.reply_text("✉️ Введите текст для рассылки всем исполнителям:", reply_markup=reply_markup)
+        return
+
+    if data == "mail_menu":
+        if role != "manager":
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        # Меню рассылок — возврат в менеджерское меню
+        context.user_data['return_to'] = 'manager_menu'
+        keyboard = [
+            [InlineKeyboardButton("📨 Обычная рассылка", callback_data="broadcast_start")],
+            [InlineKeyboardButton("🚀 Рассылка от разработчика", callback_data="dev_broadcast")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.edit_message_text("✉️ Меню рассылок — выберите действие:", reply_markup=reply_markup)
+        except:
+            await query.message.reply_text("✉️ Меню рассылок — выберите действие:", reply_markup=reply_markup)
+        return
+
+    if data == "dev_broadcast":
+        # Доступ только для разработчика (DEV_ID)
+        if DEV_ID is None or user_id != DEV_ID:
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        context.user_data['dev_broadcasting'] = True
+        context.user_data['return_to'] = 'manager_menu'
+        keyboard = [[InlineKeyboardButton("◀️ Отмена", callback_data="back_to_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await query.edit_message_text("✉️ Введите текст для рассылки от разработчика (будет отправлено всем пользователям):", reply_markup=reply_markup)
+        except:
+            await query.message.reply_text("✉️ Введите текст для рассылки от разработчика (будет отправлено всем пользователям):", reply_markup=reply_markup)
         return
 
     if data == "select_category":
@@ -438,6 +495,105 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Для альбомов фиксируем текущий альбом (сбрасываем)
         context.user_data.pop('album_id', None)
         context.user_data.pop('album_task_id', None)
+        return
+
+    if data == "export_report_photos":
+        # Выгрузить все фото 'after' со всех задач для отчета
+        if role != "manager":
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        chat_id = query.message.chat_id if query.message else update.effective_chat.id
+        tasks = db.get_tasks()
+        photos = []
+        for t in tasks:
+            for p in db.get_task_photos(t['task_id']):
+                if p.get('kind') == 'after' and p.get('file_path') and os.path.exists(p['file_path']):
+                    photos.append({'task_id': t['task_id'], 'file_path': p['file_path']})
+
+        if not photos:
+            msg = (
+                "Сейчас нет фотографий для отчета. Чтобы получить отчёт — убедитесь, что исполнители прикрепили фото результата к задачам и задачи не были удалены."
+            )
+            try:
+                await query.message.reply_text(msg)
+            except:
+                await query.message.reply_text(msg)
+            return
+
+        total = len(photos)
+        try:
+            for i in range(0, total, 10):
+                batch = photos[i:i+10]
+                media = []
+                files = []
+                for idx, ph in enumerate(batch):
+                    f = open(ph['file_path'], 'rb')
+                    files.append(f)
+                    if idx == 0:
+                        caption = f"📸 Фото для отчета — часть {i//10 + 1}. Всего фото: {total}"
+                        media.append(InputMediaPhoto(media=f, caption=caption))
+                    else:
+                        media.append(InputMediaPhoto(media=f))
+                try:
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                finally:
+                    for f in files:
+                        try:
+                            f.close()
+                        except:
+                            pass
+        except Exception as e:
+            logger.error(f"Ошибка при отправке фото для отчета менеджеру {chat_id}: {e}")
+            try:
+                await query.message.reply_text(f"❌ Ошибка при отправке фото: {e}")
+            except:
+                pass
+            return
+
+        # Создадим zip-архив со всеми фото и отправим его как документ
+        timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+        zip_name = os.path.join(PHOTOS_DIR, f"report_photos_{timestamp}.zip")
+        try:
+            with zipfile.ZipFile(zip_name, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for ph in photos:
+                    src = ph['file_path']
+                    if os.path.exists(src):
+                        arcname = os.path.basename(src)
+                        zf.write(src, arcname=arcname)
+        except Exception as e:
+            logger.error(f"Ошибка при создании zip-архива: {e}")
+            try:
+                await query.message.reply_text(f"❌ Ошибка при формировании архива: {e}")
+            except:
+                pass
+            return
+
+        try:
+            with open(zip_name, 'rb') as zf:
+                await context.bot.send_document(chat_id=chat_id, document=zf, filename=os.path.basename(zip_name))
+        except Exception as e:
+            logger.error(f"Ошибка при отправке архива менеджеру {chat_id}: {e}")
+            try:
+                await query.message.reply_text(f"❌ Ошибка при отправке архива: {e}")
+            except:
+                pass
+            try:
+                os.remove(zip_name)
+            except:
+                pass
+            return
+
+        # Удалим временный zip-файл
+        try:
+            os.remove(zip_name)
+        except:
+            pass
+
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="view_tasks_manager")]])
+        try:
+            await context.bot.send_message(chat_id=chat_id, text="Готово — архив со всеми фото отправлен.", reply_markup=reply_markup)
+        except:
+            pass
         return
 
     if data == "view_tasks_manager":
@@ -1588,7 +1744,34 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Задача #{task_id} отмечена как выполненная! Ожидайте проверки менеджером."
             )
             chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
-            await render_executor_tasks_list(context, user_id, chat_id)
+            # Пытаемся показать список задач исполнителя. Если категория не установлена или
+            # рендер списка не отправил сообщение (например, render_executor_tasks_list вернулся
+            # без отправки), делаем безопасный fallback — отправляем меню выбора категории.
+            try:
+                await render_executor_tasks_list(context, user_id, chat_id)
+            except Exception as e:
+                logger.error(f"Ошибка при рендере списка задач исполнителя: {e}", exc_info=True)
+
+            # Если после вызова render_executor_tasks_list нет сохранённого message_id —
+            # показываем альтернативное меню (категории / мои задачи), чтобы пользователь не остался без UI.
+            if not context.user_data.get('executor_list_message_id'):
+                try:
+                    # Отправим быстрый доступ к задачам исполнителя
+                    keyboard = [
+                        [InlineKeyboardButton("📋 Мои задачи", callback_data="view_tasks_executor")],
+                        [InlineKeyboardButton("🏠 В начало", callback_data="restart")]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(
+                        f"👋 {executor_username}, возвращаю меню задач:",
+                        reply_markup=reply_markup
+                    )
+                except Exception:
+                    # Последний fallback: показать выбор категории
+                    try:
+                        await send_category_selection(update.message, executor_username)
+                    except Exception:
+                        logger.error("Не удалось отобразить меню задач/категорий после выполнения задачи.", exc_info=True)
         return
 
     # Редактирование фото задачи
