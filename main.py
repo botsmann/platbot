@@ -4,7 +4,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from handlers import start, handle_message, handle_photo, button_handler
 from config import BOT_TOKEN
 
-# Настройка логирования
+# Настройка логирования тест переноса кода
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
