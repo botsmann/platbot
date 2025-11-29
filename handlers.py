@@ -99,10 +99,13 @@ async def render_executor_tasks_list(context: ContextTypes.DEFAULT_TYPE, user_id
                 logger.exception("Не удалось отправить сообщение о выборе категории")
         return
 
-    # Собираем задачи для исполнителя в этой категории
+        # Собираем задачи для исполнителя в этой категории
     tasks_new = db.get_tasks(status=STATUS_NEW, category=category) or []
     tasks_redo = db.get_tasks(status=STATUS_REDO, category=category) or []
     tasks = tasks_new + tasks_redo
+    
+    # Сортируем задачи: сначала высокий приоритет, потом обычный
+    tasks.sort(key=lambda x: (x.get('priority', 'normal') != 'high', x.get('task_id', 0)))
 
     if not tasks:
         text = "📭 Нет задач в вашей категории."
@@ -111,13 +114,19 @@ async def render_executor_tasks_list(context: ContextTypes.DEFAULT_TYPE, user_id
     else:
         # Показываем только заголовок категории в тексте — все детали (id и описание)
         # будут доступны на кнопках ниже
-        lines = [f"📂 Категория: {category}", ""]
+        lines = [f"📂 Категория: {category}", "\nПри наличии высокого приоритета 🔴 - выполнить в первую очередь\n"]
         keyboard = []
         for t in tasks:
             preview = (t.get('comment') or '')[:60]
             preview_text = preview.replace('"', '”')
-            # Формат кнопки: Задача #5 - "описание"
-            button_label = f"Задача #{t['task_id']} - \"{preview_text}\""
+            priority = t.get('priority', 'normal')
+            # Выделяем задачи с высоким приоритетом - только слева префикс 🔴
+            if priority == 'high':
+                # Добавляем 🔴 слева для высокого приоритета
+                button_label = f"🔴 Задача #{t['task_id']} - \"{preview_text}\""
+            else:
+                # Обычные задачи без обозначения
+                button_label = f"Задача #{t['task_id']} - \"{preview_text}\""
             keyboard.append([InlineKeyboardButton(button_label, callback_data=f"task_{t['task_id']}")])
         text = "\n".join(lines)
         keyboard.append([InlineKeyboardButton("🏠 В начало", callback_data="restart")])
@@ -183,19 +192,37 @@ async def send_category_selection(message_target, username: str):
     )
 
 
-async def render_manager_tasks_list(update: Update, context: ContextTypes.DEFAULT_TYPE, base_message=None):
+async def render_manager_tasks_list(update: Update, context: ContextTypes.DEFAULT_TYPE, base_message=None, page: int = 0):
     tasks = db.get_tasks()
     context.user_data['return_to'] = 'manager_menu'
+    
+    TASKS_PER_PAGE = 10
+    total_tasks = len(tasks)
+    total_pages = (total_tasks + TASKS_PER_PAGE - 1) // TASKS_PER_PAGE if total_tasks > 0 else 1
+    
+    # Ограничиваем номер страницы
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+    
     if not tasks:
         # Нет задач — покажем только текст, общие кнопки добавляем ниже (чтобы не дублировать)
         keyboard = []
         text = "📭 Нет задач."
     else:
-        text = "📊 Все задачи:\n\n"
+        # Вычисляем диапазон задач для текущей страницы
+        start_idx = page * TASKS_PER_PAGE
+        end_idx = min(start_idx + TASKS_PER_PAGE, total_tasks)
+        page_tasks = tasks[start_idx:end_idx]
+        
+        text = f"📊 Все задачи (страница {page + 1} из {total_pages}):\n\n"
         keyboard = []
-        for task in tasks:
+        for task in page_tasks:
             status_emoji = "🟢" if task['status'] == STATUS_APPROVED else "🟡" if task['status'] == STATUS_COMPLETED else "🔴" if task['status'] == STATUS_REDO else "⚪"
-            text += f"{status_emoji} Задача #{task['task_id']}\n"
+            priority = task.get('priority', 'normal')
+            priority_text = " 🔴 Высокий приоритет" if priority == 'high' else " 🟢 Обычный приоритет"
+            text += f"{status_emoji} Задача #{task['task_id']}{priority_text}\n"
             text += f"   Статус: {task['status']}\n"
             creator_username = db.get_username(task['created_by']) if task.get('created_by') else None
             if creator_username:
@@ -209,6 +236,17 @@ async def render_manager_tasks_list(update: Update, context: ContextTypes.DEFAUL
                 f"📷 Задача #{task['task_id']} - {task['status']}",
                 callback_data=f"view_task_photo_{task['task_id']}"
             )])
+        
+        # Кнопки навигации по страницам (после кнопок задач, перед служебными кнопками)
+        if total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"tasks_page_{page - 1}"))
+            if page < total_pages - 1:
+                nav_row.append(InlineKeyboardButton("Вперед ▶️", callback_data=f"tasks_page_{page + 1}"))
+            if nav_row:
+                keyboard.append(nav_row)
+    
     # Кнопки: выгрузка фото, удалить завершенные, возврат в меню
     keyboard.append([InlineKeyboardButton("📤 Выгрузить все фото для отчета", callback_data="export_report_photos")])
     keyboard.append([InlineKeyboardButton("🧹 Удалить завершенные", callback_data="delete_completed_tasks")])
@@ -256,8 +294,11 @@ async def cleanup_review_task_messages(context: ContextTypes.DEFAULT_TYPE, chat_
         return
     review_msgs = context.user_data.get('review_message_ids', {})
     ids = review_msgs.get(str(task_id), [])
+    keep_id = context.user_data.get('review_list_message_id')
     for mid in ids:
         try:
+            if keep_id and mid == keep_id:
+                continue
             await context.bot.delete_message(chat_id=chat_id, message_id=mid)
         except Exception:
             pass
@@ -456,6 +497,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role != "manager":
             await query.answer("❌ У вас нет доступа к этой функции.")
             return
+        # Сбрасываем приоритет при выборе новой категории
+        context.user_data['task_priority'] = 'normal'
         keyboard = [
             [InlineKeyboardButton("💰 Касса", callback_data="create_task_Касса")],
             [InlineKeyboardButton("🥗 Саладет", callback_data="create_task_Саладет")],
@@ -489,12 +532,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ У вас нет доступа к этой функции.")
             return
         category = data.replace("create_task_", "")
-        keyboard = [[InlineKeyboardButton("🔄 Изменить категорию", callback_data="select_category")]]
+        # Инициализируем приоритет как "normal" если его еще нет
+        if 'task_priority' not in context.user_data:
+            context.user_data['task_priority'] = 'normal'
+        priority = context.user_data.get('task_priority', 'normal')
+        
+        # Создаем кнопку приоритета (зеленая для normal, красная для high)
+        if priority == 'normal':
+            priority_button_text = "🟢 Обычный"
+        else:
+            priority_button_text = "🔴 Высокий"
+        priority_button = InlineKeyboardButton(
+            priority_button_text,
+            callback_data=f"toggle_priority_{category}"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🔄 Изменить категорию", callback_data="select_category")],
+            [priority_button]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
+        priority_text = "🟢 Обычный" if priority == 'normal' else "🔴 Высокий"
         await query.message.reply_text(
             f"📸 Отправьте фотографию места, которое нужно почистить.\n"
             f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
-            f"Категория: {category}",
+            f"⚠️ Укажите приоритет задачи (🟢 Обычный (не требует срочного выполнения) / 🔴 Высокий (выполнить в первую очередь))\n"
+            f"‼️ Не злоупотребляйте высоким приоритетом. Указывайте его по необходимости.\n\n"
+
+            f"Категория: {category}\n"
+            f"Приоритет: {priority_text}",
             reply_markup=reply_markup
         )
         context.user_data['creating_task'] = True
@@ -505,13 +571,87 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop('album_task_id', None)
         return
 
+    if data.startswith("toggle_priority_"):
+        if role != "manager":
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        category = data.replace("toggle_priority_", "")
+        # Переключаем приоритет
+        current_priority = context.user_data.get('task_priority', 'normal')
+        new_priority = 'high' if current_priority == 'normal' else 'normal'
+        context.user_data['task_priority'] = new_priority
+        
+        # Обновляем сообщение с новым приоритетом
+        if new_priority == 'normal':
+            priority_button_text = "🟢 Обычный"
+        else:
+            priority_button_text = "🔴 Высокий"
+        priority_button = InlineKeyboardButton(
+            priority_button_text,
+            callback_data=f"toggle_priority_{category}"
+        )
+        
+        priority_text = "🟢 Обычный" if new_priority == 'normal' else "🔴 Высокий"
+        
+        # Определяем, какое сообщение нужно обновить (начало создания или следующая задача)
+        message_text = query.message.text or ""
+        if "следующей задачи" in message_text:
+            # Это сообщение о следующей задаче
+            keyboard = [
+                [priority_button],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await query.edit_message_text(
+                    f"📸 Отправьте фотографию для следующей задачи.\n"
+                    f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
+                    f"Категория: {category}\n"
+                    f"Приоритет: {priority_text}",
+                    reply_markup=reply_markup
+                )
+            except:
+                await query.message.edit_text(
+                    f"📸 Отправьте фотографию для следующей задачи.\n"
+                    f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
+                    f"Категория: {category}\n"
+                    f"Приоритет: {priority_text}",
+                    reply_markup=reply_markup
+                )
+        else:
+            # Это сообщение о начале создания задачи
+            keyboard = [
+                [InlineKeyboardButton("🔄 Изменить категорию", callback_data="select_category")],
+                [priority_button]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            try:
+                await query.edit_message_text(
+                    f"📸 Отправьте фотографию места, которое нужно почистить.\n"
+                    f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
+                    f"Категория: {category}\n"
+                    f"Приоритет: {priority_text}",
+                    reply_markup=reply_markup
+                )
+            except:
+                await query.message.edit_text(
+                    f"📸 Отправьте фотографию места, которое нужно почистить.\n"
+                    f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
+                    f"Категория: {category}\n"
+                    f"Приоритет: {priority_text}",
+                    reply_markup=reply_markup
+                )
+        await query.answer()
+        return
+
     if data == "export_report_photos":
-        # Выгрузить все фото 'after' со всех задач для отчета
+        # Выгрузить все фото 'after' только с задач со статусом "Задача завершена" для отчета
         if role != "manager":
             await query.answer("❌ У вас нет доступа к этой функции.")
             return
         chat_id = query.message.chat_id if query.message else update.effective_chat.id
-        tasks = db.get_tasks()
+        # Фильтруем только задачи со статусом "Задача завершена"
+        tasks = db.get_tasks(status=STATUS_APPROVED)
         photos = []
         for t in tasks:
             for p in db.get_task_photos(t['task_id']):
@@ -675,7 +815,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         try:
-            await render_manager_tasks_list(update, context, base_message=None)
+            await render_manager_tasks_list(update, context, base_message=None, page=0)
         except Exception:
             logger.exception("Не удалось обновить список менеджера после удаления завершённых задач")
         return
@@ -705,18 +845,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.delete()
                 except Exception:
                     pass
-        # Редактируем сообщение списка задач обратно
+        # Редактируем сообщение списка задач обратно (начинаем с первой страницы)
         manager_list_id = context.user_data.get('manager_list_message_id')
         if manager_list_id and chat_id:
             # Пытаемся отредактировать сохраненное сообщение списка
             try:
-                await render_manager_tasks_list(update, context, None)
+                await render_manager_tasks_list(update, context, None, page=0)
                 return
             except Exception:
                 pass
         # Если не получилось, пробуем отредактировать текущее сообщение
         base_message = query.message
-        await render_manager_tasks_list(update, context, base_message)
+        await render_manager_tasks_list(update, context, base_message, page=0)
+        return
+
+    if data == "tasks_page_info":
+        # Просто показываем информацию о странице (не переключаем)
+        await query.answer()
+        return
+
+    if data.startswith("tasks_page_"):
+        # Обработка навигации по страницам списка задач
+        if role != "manager":
+            await query.answer("❌ У вас нет доступа к этой функции.")
+            return
+        try:
+            page = int(data.split("_")[-1])
+        except (ValueError, IndexError):
+            page = 0
+        # Отвечаем на callback сразу
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        base_message = query.message
+        await render_manager_tasks_list(update, context, base_message, page=page)
         return
 
     if data == "view_tasks_executor":
@@ -798,51 +961,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = []
         for task in tasks:
+            priority = task.get('priority', 'normal')
+            priority_text = " 🔴 Высокий" if priority == 'high' else " 🟢 Обычный"
             keyboard.append([InlineKeyboardButton(
-                f"Задача #{task['task_id']}",
+                f"Задача #{task['task_id']}{priority_text}",
                 callback_data=f"review_{task['task_id']}"
             )])
         keyboard.append([InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         # Возврат из этого экрана должен вести в меню менеджера
         context.user_data['return_to'] = 'manager_menu'
-        try:
-            await query.edit_message_text(
-                f"✅ Выберите задачу для проверки:\n"
-                f"Всего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
-                reply_markup=reply_markup
-            )
-            context.user_data['review_list_message_id'] = query.message.message_id
-        except:
-            # Если нажали «Назад» с сообщения-фото — редактируем сохранённый список
-            list_id = context.user_data.get('review_list_message_id')
-            chat_id = query.message.chat_id if query.message else update.effective_chat.id
-            if list_id:
+        # Всегда стараемся отредактировать сохранённое сообщение списка, а текущее — удалить
+        list_id = context.user_data.get('review_list_message_id')
+        chat_id = query.message.chat_id if query.message else update.effective_chat.id
+        if list_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=list_id,
+                    text=f"✅ Выберите задачу для проверки:\nВсего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
+                    reply_markup=reply_markup
+                )
+            except Exception:
+                # Если по какой-то причине нельзя — используем текущее сообщение
                 try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=list_id,
-                        text=f"✅ Выберите задачу для проверки:\nВсего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
+                    await query.edit_message_text(
+                        f"✅ Выберите задачу для проверки:\n"
+                        f"Всего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
                         reply_markup=reply_markup
                     )
-                    try:
-                        await query.message.delete()
-                    except:
-                        pass
-                except:
+                    context.user_data['review_list_message_id'] = query.message.message_id
+                except Exception:
+                    pass
+            # Удаляем текущее сообщение, если оно отличается
+            try:
+                if query.message and query.message.message_id != list_id:
+                    await query.message.delete()
+            except Exception:
+                pass
+        else:
+            try:
+                await query.edit_message_text(
+                    f"✅ Выберите задачу для проверки:\n"
+                    f"Всего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
+                    reply_markup=reply_markup
+                )
+                context.user_data['review_list_message_id'] = query.message.message_id
+            except Exception:
+                try:
                     await query.message.edit_text(
                         f"✅ Выберите задачу для проверки:\n"
                         f"Всего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
                         reply_markup=reply_markup
                     )
                     context.user_data['review_list_message_id'] = query.message.message_id
-            else:
-                await query.message.edit_text(
-                    f"✅ Выберите задачу для проверки:\n"
-                    f"Всего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}",
-                    reply_markup=reply_markup
-                )
-                context.user_data['review_list_message_id'] = query.message.message_id
+                except Exception:
+                    pass
         return
 
     if data.startswith("view_task_photo_"):
@@ -995,7 +1169,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         if chat_id:
             await cleanup_manager_task_messages(context, chat_id, task_id)
-        await render_manager_tasks_list(update, context)
+        await render_manager_tasks_list(update, context, page=0)
         keyboard = [[InlineKeyboardButton("◀️ Назад к списку задач", callback_data="view_tasks_manager")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         if chat_id:
@@ -1019,19 +1193,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id:
             await cleanup_manager_task_messages(context, chat_id, task_id)
             await cleanup_review_task_messages(context, chat_id, task_id)
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await render_manager_tasks_list(update, context)
-        keyboard = [[InlineKeyboardButton("◀️ Назад к списку задач", callback_data="view_tasks_manager")]]
+        tasks = db.get_tasks(status=STATUS_COMPLETED)
+        all_tasks = db.get_tasks()
+        approved_tasks = db.get_tasks(status=STATUS_APPROVED)
+        keyboard = []
+        for t in tasks:
+            pr = t.get('priority', 'normal')
+            pr_text = " 🔴 Высокий" if pr == 'high' else " 🟢 Обычный"
+            keyboard.append([InlineKeyboardButton(f"Задача #{t['task_id']}{pr_text}", callback_data=f"review_{t['task_id']}")])
+        keyboard.append([InlineKeyboardButton("◀️ Главное меню", callback_data="back_to_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        if chat_id:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ Задача #{task_id} удалена.",
-            reply_markup=reply_markup
+        text = (
+            f"✅ Выберите задачу для проверки:\n"
+            f"Всего задач: {len(all_tasks)} | На проверке: {len(tasks)} | Завершено: {len(approved_tasks)}"
         )
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup)
+            context.user_data['review_list_message_id'] = query.message.message_id
+        except Exception:
+            try:
+                sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+                context.user_data['review_list_message_id'] = sent.message_id
+            except Exception:
+                pass
         return
 
     if data.startswith("confirm_delete_"):
@@ -1049,7 +1233,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.delete()
         except Exception:
             pass
-        await render_manager_tasks_list(update, context)
+        await render_manager_tasks_list(update, context, page=0)
         keyboard = [[InlineKeyboardButton("◀️ Назад к списку задач", callback_data="view_tasks_manager")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         if chat_id:
@@ -1151,6 +1335,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        priority = task.get('priority', 'normal')
+        priority_text = "\n🔴 ВЫСОКИЙ ПРИОРИТЕТ!" if priority == 'high' else ""
+        header_text = f"📋 Задача #{task_id}{priority_text}\n\n{task['comment']}\n\nСтатус: {task['status']}"
+        # Удаляем исходное сообщение списка, чтобы не было "первого" сообщения
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
         # Собираем все фото "до" и отправляем как альбом
         before_photos = [p for p in db.get_task_photos(task_id) if p.get('kind') == 'before' and p.get('file_path') and os.path.exists(p['file_path'])]
         chat_id = query.message.chat_id if query.message else update.effective_chat.id
@@ -1162,7 +1355,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f = open(ph['file_path'], 'rb')
                 files.append(f)
                 if idx == 0:
-                    caption = f"📋 Задача #{task_id}\n\n{task['comment']}\n\nСтатус: {task['status']}"
+                    caption = header_text
                     media.append(InputMediaPhoto(media=f, caption=caption))
                 else:
                     media.append(InputMediaPhoto(media=f))
@@ -1176,19 +1369,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f.close()
                     except:
                         pass
-        # Если фото нет, отправим текст
-        if not sent_any:
+        # После фото отправляем отдельное сообщение с кнопками действий
+        try:
+            action_msg = await context.bot.send_message(chat_id=chat_id, text="Выберите действие:", reply_markup=reply_markup)
+            task_message_ids.append(action_msg.message_id)
+        except Exception:
             try:
-                await query.edit_message_text(
-                    f"📋 Задача #{task_id}\n\n{task['comment']}\n\nСтатус: {task['status']}"
-                )
-            except:
-                await query.message.edit_text(
-                    f"📋 Задача #{task_id}\n\n{task['comment']}\n\nСтатус: {task['status']}"
-                )
-        # Кнопки действия отдельным сообщением
-        action_msg = await query.message.reply_text("Выберите действие:", reply_markup=reply_markup)
-        task_message_ids.append(action_msg.message_id)
+                action_msg = await query.message.reply_text("Выберите действие:", reply_markup=reply_markup)
+                task_message_ids.append(action_msg.message_id)
+            except Exception:
+                pass
         executor_task_msgs[str(task_id)] = task_message_ids
         context.user_data['executor_task_message_ids'] = executor_task_msgs
         context.user_data['current_executor_task_id'] = task_id
@@ -1235,8 +1425,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Заголовок
-        header_text = f"📋 Задача #{task_id}\n\nКомментарий: {task['comment']}\nСтатус: {task['status']}"
+        priority = task.get('priority', 'normal')
+        priority_text = " 🔴 Высокий приоритет" if priority == 'high' else " 🟢 Обычный приоритет"
+        header_text = f"📋 Задача #{task_id}{priority_text}\n\nКомментарий: {task['comment']}\nСтатус: {task['status']}"
         chat_id = query.message.chat_id if query.message else update.effective_chat.id
+
+        # Удаляем исходное сообщение списка, чтобы не было лишнего первого сообщения
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        # Сбрасываем сохраненный id списка, он больше не актуален
+        try:
+            context.user_data.pop('review_list_message_id', None)
+        except Exception:
+            pass
         # Альбомы "до" (менеджер) и "после" (исполнитель) из расширенной таблицы
         before_list = [p for p in db.get_task_photos(task_id) if p.get('kind') == 'before' and p.get('file_path') and os.path.exists(p['file_path'])]
         after_list = [p for p in db.get_task_photos(task_id) if p.get('kind') == 'after' and p.get('file_path') and os.path.exists(p['file_path'])]
@@ -1299,19 +1502,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task_msg_ids.append(sent_btn.message_id)
         else:
             # Нет фото "после" — отправляем предупреждение с кнопками
-            sent = await query.message.reply_text("⚠️ Исполнитель не прикрепил фото результата.", reply_markup=reply_markup)
+            sent = await context.bot.send_message(chat_id=chat_id, text="⚠️ Исполнитель не прикрепил фото результата.", reply_markup=reply_markup)
             task_msg_ids.append(sent.message_id)
         review_msgs[str(task_id)] = task_msg_ids
         context.user_data['review_message_ids'] = review_msgs
         
-        # Редактируем старое сообщение (убираем кнопки)
-        try:
-            await query.edit_message_caption(
-                caption=query.message.caption,
-                reply_markup=None
-            )
-        except:
-            pass
+        # Сообщение списка уже отредактировано выше, дополнительные кнопки убраны вместе с заменой текста
         return
 
     if data.startswith("approve_"):
@@ -1323,6 +1519,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id:
             await cleanup_review_task_messages(context, chat_id, task_id)
             await cleanup_manager_task_messages(context, chat_id, task_id)
+            # Удаляем заголовок/список, если он есть, чтобы не мешал после утверждения
+            try:
+                list_id = context.user_data.get('review_list_message_id')
+                if list_id:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=list_id)
+                    context.user_data.pop('review_list_message_id', None)
+            except Exception:
+                pass
         
         db.update_task_status(task_id, STATUS_APPROVED)
         
@@ -1539,15 +1743,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['task_id'] = None
         context.user_data['task_step'] = "photo"
         # Сохраняем категорию для следующей задачи
+        # Инициализируем приоритет как "normal" если его еще нет, иначе сохраняем текущий
+        if 'task_priority' not in context.user_data:
+            context.user_data['task_priority'] = 'normal'
+        priority = context.user_data.get('task_priority', 'normal')
         
-        keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")]]
+        # Создаем кнопку приоритета
+        if priority == 'normal':
+            priority_button_text = "🟢 Обычный"
+        else:
+            priority_button_text = "🔴 Высокий"
+        priority_button = InlineKeyboardButton(
+            priority_button_text,
+            callback_data=f"toggle_priority_{category}"
+        )
+        
+        keyboard = [
+            [priority_button],
+            [InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         # Возврат из этого шага должен вести в меню менеджера
         context.user_data['return_to'] = 'manager_menu'
+        priority_text = "🟢 Обычный" if priority == 'normal' else "🔴 Высокий"
         await update.message.reply_text(
             f"📸 Отправьте фотографию для следующей задачи.\n"
             f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
-            f"Категория: {category}",
+            f"Категория: {category}\n"
+            f"Приоритет: {priority_text}",
             reply_markup=reply_markup
         )
         return
@@ -1695,7 +1918,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 task_id = context.user_data['album_task_id']
                 db.add_task_photo(task_id, 'before', photo.file_id, photo_path)
             else:
-                task_id = db.create_task(user_id, photo.file_id, photo_path, caption, category)
+                priority = context.user_data.get('task_priority', 'normal')
+                task_id = db.create_task(user_id, photo.file_id, photo_path, caption, category, priority)
                 # Сохраняем это фото как дополнительное тоже для списка
                 db.add_task_photo(task_id, 'before', photo.file_id, photo_path)
                 if media_group_id:
@@ -1730,15 +1954,34 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Сразу начинаем создание следующей задачи в той же категории
             context.user_data['task_step'] = "photo"
             # Сохраняем категорию для следующей задачи
+            # Инициализируем приоритет как "normal" если его еще нет, иначе сохраняем текущий
+            if 'task_priority' not in context.user_data:
+                context.user_data['task_priority'] = 'normal'
+            priority = context.user_data.get('task_priority', 'normal')
             
-            keyboard = [[InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")]]
+            # Создаем кнопку приоритета
+            if priority == 'normal':
+                priority_button_text = "🟢 Обычный"
+            else:
+                priority_button_text = "🔴 Высокий"
+            priority_button = InlineKeyboardButton(
+                priority_button_text,
+                callback_data=f"toggle_priority_{category}"
+            )
+            
+            keyboard = [
+                [priority_button],
+                [InlineKeyboardButton("🏠 В главное меню", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             # Возврат из этого шага должен вести в меню менеджера
             context.user_data['return_to'] = 'manager_menu'
+            priority_text = "🟢 Обычный" if priority == 'normal' else "🔴 Высокий"
             await update.message.reply_text(
                 f"📸 Отправьте фотографию для следующей задачи.\n"
                 f"Можно одно фото или несколько фото ОДНИМ сообщением (альбомом). Все фото прикрепляйте в одном сообщении.\n\n"
-                f"Категория: {category}",
+                f"Категория: {category}\n"
+                f"Приоритет: {priority_text}",
                 reply_markup=reply_markup
             )
         else:
@@ -1749,7 +1992,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.add_task_photo(task_id, 'before', photo.file_id, photo_path)
                 return
             else:
-                task_id = db.create_task(user_id, photo.file_id, photo_path, "Введите комментарий...", category)
+                priority = context.user_data.get('task_priority', 'normal')
+                task_id = db.create_task(user_id, photo.file_id, photo_path, "Введите комментарий...", category, priority)
             context.user_data['task_id'] = task_id
             context.user_data['photo_id'] = photo.file_id
             context.user_data['photo_path'] = photo_path
@@ -1920,4 +2164,3 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("Пожалуйста, используйте кнопки меню для работы с фотографиями.")
-

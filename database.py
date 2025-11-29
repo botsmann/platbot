@@ -58,6 +58,12 @@ class Database:
             cursor.execute("ALTER TABLE tasks ADD COLUMN category TEXT")
         except sqlite3.OperationalError:
             pass  # Поле уже существует
+        
+        # Добавляем поле priority в tasks, если его нет
+        try:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN priority TEXT DEFAULT 'normal'")
+        except sqlite3.OperationalError:
+            pass  # Поле уже существует
 
         # Добавляем поле category в users, если его нет
         try:
@@ -364,7 +370,7 @@ class Database:
         conn.close()
         return [{'user_id': row[0], 'username': row[1]} for row in rows]
 
-    def create_task(self, created_by: int, photo_id: str, photo_path: str, comment: str, category: str) -> int:
+    def create_task(self, created_by: int, photo_id: str, photo_path: str, comment: str, category: str, priority: str = 'normal') -> int:
         """Создать новую задачу с минимальным доступным ID"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -380,9 +386,9 @@ class Database:
         
         # Вставляем задачу с найденным ID
         cursor.execute("""
-            INSERT INTO tasks (task_id, created_by, photo_before_id, photo_before_path, comment, status, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (task_id, created_by, photo_id, photo_path, comment, "Новая", category))
+            INSERT INTO tasks (task_id, created_by, photo_before_id, photo_before_path, comment, status, category, priority)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (task_id, created_by, photo_id, photo_path, comment, "Новая", category, priority))
         
         conn.commit()
         conn.close()
@@ -396,25 +402,25 @@ class Database:
         if status and category:
             cursor.execute("""
                 SELECT task_id, created_by, photo_before_id, photo_before_path, comment, 
-                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at
+                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at, priority
                 FROM tasks WHERE status = ? AND category = ? ORDER BY created_at DESC
             """, (status, category))
         elif status:
             cursor.execute("""
                 SELECT task_id, created_by, photo_before_id, photo_before_path, comment, 
-                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at
+                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at, priority
                 FROM tasks WHERE status = ? ORDER BY created_at DESC
             """, (status,))
         elif category:
             cursor.execute("""
                 SELECT task_id, created_by, photo_before_id, photo_before_path, comment, 
-                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at
+                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at, priority
                 FROM tasks WHERE category = ? ORDER BY created_at DESC
             """, (category,))
         else:
             cursor.execute("""
                 SELECT task_id, created_by, photo_before_id, photo_before_path, comment, 
-                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at
+                       status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at, priority
                 FROM tasks ORDER BY created_at DESC
             """)
         
@@ -435,7 +441,8 @@ class Database:
                 'photo_after_id': row[8] if len(row) > 8 else None,
                 'photo_after_path': row[9] if len(row) > 9 else None,
                 'created_at': row[10] if len(row) > 10 else None,
-                'completed_at': row[11] if len(row) > 11 else None
+                'completed_at': row[11] if len(row) > 11 else None,
+                'priority': row[12] if len(row) > 12 else 'normal'
             })
         return tasks
 
@@ -445,7 +452,7 @@ class Database:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT task_id, created_by, photo_before_id, photo_before_path, comment, 
-                   status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at
+                   status, category, completed_by, photo_after_id, photo_after_path, created_at, completed_at, priority
             FROM tasks WHERE task_id = ?
         """, (task_id,))
         row = cursor.fetchone()
@@ -464,7 +471,8 @@ class Database:
                 'photo_after_id': row[8] if len(row) > 8 else None,
                 'photo_after_path': row[9] if len(row) > 9 else None,
                 'created_at': row[10] if len(row) > 10 else None,
-                'completed_at': row[11] if len(row) > 11 else None
+                'completed_at': row[11] if len(row) > 11 else None,
+                'priority': row[12] if len(row) > 12 else 'normal'
             }
         return None
 
